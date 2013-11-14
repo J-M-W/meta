@@ -18,30 +18,42 @@ typedef struct
 
 typedef struct 
 {
+	/* PARAMETERS READ FROM INPUT */
 	int nDim; /* Dimensionality of CV-space */
-	char* lscapeName; /* Landscape name: must be one of 'harmonic' */
-	/* Energy landscape parameters */
-	double k;
-	/* Functor to function used to calculate energy landscape */
-	double (*energyPtr)(double*, struct argstruct*);
-	/* Gaussian parameters. */
-	double sigma;
-	double w;
-	double Vmax;
+	int calcMethod[2]; /* 0th element: zeroth derivatives. 1st element: 2nd derivatives. 0: on-the-fly analytic; 1: on-the-fly numerical; 2: tabulated analytic; 3: tabulated numerical */
+	int lscape; /* Landscape number */
 	/* Dynamical parameters */
 	double T;
 	double dt;
 	double g;
+	double m;
+	/* Interpolation parameters */
+	double n; /* Resolution of grid */
+	double* bounds;
+	double* deltas;
+	double* eGrid; /* Energy landscape used for interpolation */
+	double** fGrid; /* grad(E) used for interpolation. 2nd index corresponds to different dimensions */
 
+	/* LANDSCAPE-SPECIFIC PARAMETERS */
+	/* Harmonic parameters */
+	double k;
+	/* Gaussian parameters */
+	double sigma;
+	double w;
+	double Vmax;
+
+	/* 'DERIVED' PARAMETERS */
+	double c1;
+	double c3;
 }argstruct;
 
 
 
 unsigned int get_input(char**);
 int get_force(double* r, double* f, gauss* gaussians, int nGauss, argstruct* args);
-void evolve_cvs(double* r, double* p, double* f, double m, double dt, double T, double g, int nDim, gauss* gaussians, int nGauss, argstruct* args);
+void evolve_cvs(double* r, double* p, double* f, gauss* gaussians, int nGauss, argstruct* args);
 double** malloc2d(int nx, int ny);
-int parse_args(int, char**, struct argstruct*);
+int initialise_metadynamics(int, char**, struct argstruct*);
 double* grad(double* r, double h, struct argstruct*);
 double* get_bounds(double**, int, int);
 double** calc_landscape(double* bounds, int n, argstruct* args, gauss* gaussians, int nGauss, int tStep, FILE* f);
@@ -49,18 +61,19 @@ void recurse_landscape(int** indices, int* indCount, int* indTemp, int digit, in
 int append(double*** arrayPtr, int* rowPtr, int col, double* newRow, int rowIndex);
 double rand_normal();
 double eval_gaussian(gauss* gaussian, double* r, int nDim);
-double eval_mueller(double* r, argstruct* args, int deriv, int derivCoord);
+double eval_potential(double* r, argstruct* args, int deriv, int derivCoord);
+double* populate_landscape(double* bounds, int n, argstruct* args)
 
 int main(int argc, char* argv[])
 {
     double dt=1E-2;
     int tStepsInit  = 1E1;        /* Initial number of timesteps - arrays will be extended beyond this if necessary */
-	int tStepsLimit = 1E5;        /* Hard limit on the number of timesteps - simulation terminates at this point */ 
+	int tStepsLimit = 1E4;        /* Hard limit on the number of timesteps - simulation terminates at this point */ 
 	int tStep = 0;                /* Number of tSteps simulated */
     double r[] = {0.2,0.5};    /* Position vector in configuration space, and its initial value */
 	//double r[] = {4,1};    /* Position vector in configuration space, and its initial value */
     double p[] = {0,0};      /* Momentum vector in configuration space, and its initial value */
-    int gaussInterval=50;
+    int gaussInterval=10;
 	int n=50; /* Dimensions on grid to evaluate the energy landscape on */
 
     double **visited; /* Array of visited positions */
@@ -74,15 +87,12 @@ int main(int argc, char* argv[])
 	double* bounds;
 	double* trajEnergy;     /* True energy at each visited point on the trajectory */
 	double* metaTrajEnergy; /* Same as above, but with metadynamics Gaussians included */
-	double T=0.01; /* Temperature */
-	double g=1; /* Friction constant */
-	double m=1;
     FILE* fOut;
 	gauss* gaussians;
 
 	/* Parse command line args; store them in the struct */
-	memset(&args, 0, sizeof(argstruct));
-	parse_args(argc, argv, &args);
+	//memset(&args, 0, sizeof(argstruct));
+	initialise_metadynamics(argc, argv, &args);
 	
 	nDim = args.nDim;
 	f = (double*)malloc(nDim*sizeof(double));
@@ -96,12 +106,13 @@ int main(int argc, char* argv[])
 	gaussians = (gauss*)malloc(gaussArraySize*sizeof(gauss));
 	/* Initialise force */
 	get_force(r, f, gaussians, nGauss, &args);
+
     /* Begin simulation */
     for(tStep=0; tStep<tStepsLimit; tStep++)
     {
         /* Get force and iterate */
 		//puts("Evolving CVs");
-        evolve_cvs(r, p, f, m, dt, T, g, nDim, gaussians, nGauss, &args);
+        evolve_cvs(r, p, f, gaussians, nGauss, &args);
         /* Append to visited */
 		//puts("Appending to visited location data");
 		append(&visited, &visitedSize, args.nDim, r, tStep);
@@ -119,9 +130,9 @@ int main(int argc, char* argv[])
 			gaussians[nGauss].r = (double*)malloc(nDim*sizeof(double));
 			// TODO - free these at the end. Memory leak.
 			memcpy((gaussians[nGauss]).r,  r, nDim*sizeof(double));
-			gaussians[nGauss].E = args.energyPtr(r, &args);
+			gaussians[nGauss].E = eval_potential(r, &args, 0, 0);
 			gaussians[nGauss].h = (args.w)*exp(-gaussians[nGauss].E/args.Vmax);
-			//printf("%lf\n", gaussians[nGauss].h);
+			printf("E=%lf, h=%lf\n", gaussians[nGauss].E, gaussians[nGauss].h);
 			gaussians[nGauss].sig = args.sigma;
             nGauss++;
         }
@@ -156,9 +167,9 @@ int main(int argc, char* argv[])
 	fprintf(fOut, "GAUSSIAN W = %g\n", args.w);
 
 	/* Landscape-specific parameters */
-	if(strcmp(args.lscapeName, "harmonic")==0)
+	if(args.lscape==0)
 	{
-		fprintf(fOut, "LANDSCAPE = HARMONIC\n");
+		fprintf(fOut, "LANDSCAPE = MUELLER\n");
 	}
 
     fprintf(fOut, DIVIDER);
@@ -182,7 +193,8 @@ int main(int argc, char* argv[])
 	fprintf(fOut, "ENERGIES:\n");
 	for(i=0; i<tStep; i++)
 	{
-		fprintf(fOut, "%g\n", args.energyPtr(visited[i], &args));
+		/* TODO: have the energies stored during the simulation time so this doesn't need recalculating */
+		fprintf(fOut, "%g\n", eval_potential(visited[i], &args, 0, 0));
 	}
 	fprintf(fOut, DIVIDER);
 
@@ -229,11 +241,13 @@ int main(int argc, char* argv[])
     return 0;
 }
 
-void evolve_cvs(double* r, double* p, double* f, double m, double dt, double T, double g, int nDim, gauss* gaussians, int nGauss, argstruct* args)
+void evolve_cvs(double* r, double* p, double* f, gauss* gaussians, int nGauss, argstruct* args)
 {
 	/* Position r, momentum p, force f, mass m, timestep dt, temperature T, friction constant g, in nDim-dimensional space */
 	double c1, c3;
 	int i;
+	double dt = args->dt;
+	double m  = args->m;
     /* Euler integration :( */
 	//int i;
 	//for(i=0; i<nDim; i++)
@@ -245,9 +259,9 @@ void evolve_cvs(double* r, double* p, double* f, double m, double dt, double T, 
 	//}
 
 	/* BAOAB integration scheme */
-	c1 = exp(-g*dt);
-	c3 = sqrt(T*(1-c1*c1));
-	for(i=0; i<nDim; i++)
+	c1 = exp(-(args->g)*dt);
+	c3 = sqrt((args->T)*(1-c1*c1));
+	for(i=0; i<(args->nDim); i++)
 	{
 		p[i] += dt*f[i]*0.5;
 		r[i] += dt*p[i]/(2*m);
@@ -255,7 +269,7 @@ void evolve_cvs(double* r, double* p, double* f, double m, double dt, double T, 
 		r[i] += dt*p[i]/(2*m); 
 	}
     get_force(r, f, gaussians, nGauss, args);
-	for(i=0; i<nDim; i++){p[i] += f[i]*dt*0.5;}
+	for(i=0; i<(args->nDim); i++){p[i] += f[i]*dt*0.5;}
 }
 
 double eval_harmonic(double* r, argstruct* args)
@@ -283,9 +297,16 @@ double eval_double_harmonic(double* r, argstruct* args)
 	return energy;
 }
 
-double eval_mueller(double* r, argstruct* args, int deriv, int derivCoord)
+double eval_potential(double* r, argstruct* args, int deriv, int derivCoord)
 {
-	return mueller(r, deriv, derivCoord);
+	switch(args->lscape)
+	{
+		case 0:
+			return mueller(r, deriv, derivCoord);
+		default:
+			printf("No potential with code %d\n", args->lscape);
+			exit(EXIT_FAILURE);
+	}
 }
 
 double* grad(double* r, double h, argstruct* args)
@@ -312,7 +333,7 @@ double* grad(double* r, double h, argstruct* args)
 		rPlus[i]  += h;
 		rMinus[i] -= h;
 		/* Use f(x+h)-f(x-h)/2h to evaluate the partial derivative */
-		output[i] = (args->energyPtr(rPlus, args) - args->energyPtr(rMinus, args))/(2*h);
+		output[i] = (eval_potential(rPlus, args, 0, 0) - eval_potential(rMinus, args, 0, 0))/(2*h);
 		//printf("E_+ = %lf, E_- = %lf\n", args->energyPtr(rPlus, args), args->energyPtr(rMinus, args));
 		//printf("r_%d = %lf, grad_%d = %lf\n", i, r[i], i, output[i]);
 	}
@@ -365,7 +386,7 @@ int get_force(double* r, double* f, gauss* gaussians, int nGauss, argstruct* arg
 		{
 			f[j] += (gaussians[i].h)*(r[j]-gaussians[i].r[j])*expFactor/ds;
 		}
-		//printf("%lf\n", gaussians[i].h);
+		//printf("h=%lf\n", gaussians[i].h);
     }
 	//printf("Force after Gaussians =  %lf\n", f[0]);
 	//puts("--------------------------");
@@ -421,26 +442,59 @@ double** malloc2d(int nx, int ny)
     return array;
 }
 
-int parse_args(int argc, char* argv[], argstruct* structptr)
+int initialise_metadynamics(int argc, char* argv[], argstruct* structptr)
 {
-	//puts("Parsing command line arguments.");
-	//char s[100];
-	//puts("TEST1");
-	//sscanf(argv[1], "%s", s);
-	//puts("TEST2");
-	//printf("%s\n", s);
-	//return 1;
-	/* TO BE IMPLEMENTED LATER, maybe with input file; for now, just set the same options each time */
-	structptr->lscapeName="Mueller";
-	structptr->k=1;
+	double default_Vmax[] = {25};
+	structptr->Vmax=-1.0;
+
+	/* PARSE */
+
+	/* TO BE IMPLEMENTED LATER, with input file; for now, just set the same options each time */
 	structptr->nDim=2;
-	structptr->energyPtr=&eval_mueller;
+	structptr->lscape=0;
+	structptr->k=1;
 	structptr->sigma=1;
-	structptr->w=2.0000;
-	structptr->g=1;
+	structptr->w=1.0000;
 	structptr->T=0.1;
-	structptr->dt=1E-3;
-	structptr->Vmax=5;
+	structptr->dt=1E-2;
+	structptr->g=1E1;
+	structptr->m=1;
+	structptr->bounds = malloc(2*(structptr->nDim)*sizeof(double));
+	bounds[0] = -5;
+	bounds[1] = 5;
+	bounds[2] = -5;
+	bounds[3] = 5;
+	args->lscape[0] = 0;
+	args->lscape[1] = 1;
+	/* Use default arguments if not manually overridden */
+	if(Vmax<0){structptr->Vmax = default_Vmax[structptr->lscape];}
+
+	/* INITIALISE */
+	switch(args->lscape[0]) /* Calculation method for E(r) */
+	{
+		case 0:
+			break;
+		case 2:
+			structptr->eGrid = populate_landscape(structptr->bounds, structptr->n, structptr);
+			break;
+		case 3:
+			structptr->eGrid = populate_landscape(structptr->bounds, structptr->n, structptr);
+			break;
+		default:
+			printf("No calculation method for E(r) with code %d\n", args->lscape[0]);
+			exit(EXIT_FAILURE);
+	}
+	switch(args->lscape[1]) /* Calculation method for grad E(r) */
+	{
+		case 0:
+			structptr->eGrid = populate_landscape(structptr->bounds, structptr->n, structptr);
+		case 1:
+			break;
+		default:
+			printf("No calculation method for grad E(r) with code %d\n", args->lscape[1]);
+			exit(EXIT_FAILURE);
+	}
+
 	return 1;
 }
 
@@ -571,7 +625,7 @@ double** calc_landscape(double* bounds, int n, argstruct* args, gauss* gaussians
 		}
 
 		/* Get true energy */
-		energy = args->energyPtr(r, args);
+		energy = eval_potential(r, args, 0, 0);
 		fprintf(f, "%g", energy);
 
 		/* Get metadynamics energy (excluding the true energy) */
@@ -597,7 +651,7 @@ double** calc_landscape(double* bounds, int n, argstruct* args, gauss* gaussians
 
 void recurse_landscape(int** indices, int* indCount, int* indTemp, int digit, int nDim, int n)
 {
-	/* Used for recursive calculation of the energy landscape within an nDim-dimensional grid divided into n points per grid points
+	/* Used for recursive calculation of the energy landscape within an nDim-dimensional grid of dimensions n by n by ... by n
 	indices is the table of indices to be filled, indTemp stores a single set of indices temporarily, indCount stores the extent to which indices has been filled */
 	int i, j;
 	//printf("Recursion level %d\n", digit);
@@ -637,8 +691,6 @@ double rand_normal()
 	{
 		init_genrand(1);
 	}
-	nCalls += 1;
-
 	/* Check if we have a random number left over; if so, return it, and if not, generate two new ones */
 	if(nCalls%2==1)
 	{
@@ -661,17 +713,90 @@ double rand_normal()
 		//printf("RETURNING: %lf\n", rand1);
 		return rand1*fac;
 	}
+	nCalls++;
 }
 
 double eval_gaussian(gauss* gaussian, double* r, int nDim)
 {
-	/* Evaluates gaussian at position r */
+	/* Evaluates contribution from gaussian to the energy at position r */
 	double expFactor=0;
 	int i;
 	for(i=0; i<nDim; i++)
 	{
 		expFactor += (r[i]-gaussian->r[i])*(r[i]-gaussian->r[i]);
 	}
-	expFactor = exp(-expFactor/(2*gaussian->sig));
-	return gaussian->h*expFactor;
+	expFactor = exp(-expFactor/(2*(gaussian->sig)));
+	return (gaussian->h)*expFactor;
+}
+
+double* populate_landscape(double* bounds, int n, argstruct* args)
+{
+	/* Returns an array of doubles constituting a flattened n-dimensional grid on whose points the energy is evaluated.
+	bounds = array of bounds [x_min, x_max, y_min, y_max, ...]
+	n  = [x-resolution, y-resolution, ...] 
+	*/
+	int nDim = args->nDim;
+	int nPoints; /* Number of grid points in the n-dimensional grid */
+	int** indices; /* nPoints-by-nDim array of index 'vectors' */
+	int i, j, k, indCount;
+	int* indTemp;
+	double* delta;
+	double* r;
+	double* energies;
+	double energy, metaEnergy, expFactor, expTotal;
+    double w=(*args).w;
+    double ds=(*args).sigma;
+
+	/* Compute [dx, dy, ...] */
+	delta = (double*)malloc(nDim*sizeof(double));
+	for(i=0; i<nDim; i++)
+	{
+		delta[i] = (double)i*(bounds[2*i+1]-bounds[i])/n;
+	}
+
+	/* Set nPoints=n^nDim */
+	nPoints=1;
+	for(i=0; i<nDim; i++){nPoints *= n;}
+
+	r = (double*)malloc(nDim*sizeof(double));
+	indTemp = (int*)malloc(nDim*sizeof(int));
+	indices = (int**)malloc(nPoints*sizeof(int*));
+	if(indices==NULL)
+	{
+		puts("Malloc failed in function calc_landscape");
+		exit(EXIT_FAILURE);
+	}
+	for(i=0; i<nPoints; i++)
+	{
+		indices[i] = (int*)malloc(nDim*sizeof(int));
+		if(indices[i]==NULL)
+		{
+			puts("Malloc failed in function calc_landscape");
+			exit(EXIT_FAILURE);
+		}
+	}
+	indCount=0;
+
+	/* Get list of indices for grid points in the nDim-dimensional hypercuboid */
+	puts("Recursively calculating energy landscape");
+	recurse_landscape(indices, &indCount, indTemp, 0, nDim, n);
+
+	/* Populate grid at the points specified by 'ind' */
+	energies = (double*)malloc(nPoints*sizeof(double));
+	for(i=0; i<nPoints; i++)
+	{
+		/* Convert the indices to a position vector based on the calculated bounds and desired number of points */
+		for(j=0; j<nDim; j++)
+		{
+			r[j] = bounds[2*j] + (double)indices[i][j]*delta[j];
+		}
+
+		/* Get true energy at the current position and assign it to the array */
+		energy = eval_potential(r, args, 0, 0);
+		energies[i] = energy;
+	}
+	free(indTemp);
+	free(indices);
+	free(r);
+	return energies;
 }
