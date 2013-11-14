@@ -27,6 +27,10 @@ typedef struct
 	double dt;
 	double g;
 	double m;
+	/* Gaussian parameters */
+	double sigma;
+	double w;
+	double Vmax;
 	/* Interpolation parameters */
 	double n; /* Resolution of grid */
 	double* bounds;
@@ -37,10 +41,6 @@ typedef struct
 	/* LANDSCAPE-SPECIFIC PARAMETERS */
 	/* Harmonic parameters */
 	double k;
-	/* Gaussian parameters */
-	double sigma;
-	double w;
-	double Vmax;
 
 	/* 'DERIVED' PARAMETERS */
 	double c1;
@@ -62,7 +62,7 @@ int append(double*** arrayPtr, int* rowPtr, int col, double* newRow, int rowInde
 double rand_normal();
 double eval_gaussian(gauss* gaussian, double* r, int nDim);
 double eval_potential(double* r, argstruct* args, int deriv, int derivCoord);
-double* populate_landscape(double* bounds, int n, argstruct* args)
+double* populate_landscape(double* bounds, int n, argstruct* args);
 
 int main(int argc, char* argv[])
 {
@@ -299,13 +299,21 @@ double eval_double_harmonic(double* r, argstruct* args)
 
 double eval_potential(double* r, argstruct* args, int deriv, int derivCoord)
 {
-	switch(args->lscape)
+	if(args->calcMethod[deriv]==0)
 	{
-		case 0:
-			return mueller(r, deriv, derivCoord);
-		default:
-			printf("No potential with code %d\n", args->lscape);
-			exit(EXIT_FAILURE);
+		switch(args->lscape)
+		{
+			case 0:
+				return mueller(r, deriv, derivCoord);
+			default:
+				printf("No potential with code %d\n", args->lscape);
+				exit(EXIT_FAILURE);
+		}
+	}
+	else
+	{
+		puts("Invalid arguments to eval_potential");
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -460,17 +468,17 @@ int initialise_metadynamics(int argc, char* argv[], argstruct* structptr)
 	structptr->g=1E1;
 	structptr->m=1;
 	structptr->bounds = malloc(2*(structptr->nDim)*sizeof(double));
-	bounds[0] = -5;
-	bounds[1] = 5;
-	bounds[2] = -5;
-	bounds[3] = 5;
-	args->lscape[0] = 0;
-	args->lscape[1] = 1;
+	structptr->bounds[0] = -5;
+	structptr->bounds[1] = 5;
+	structptr->bounds[2] = -5;
+	structptr->bounds[3] = 5;
+	structptr->calcMethod[0] = 0;
+	structptr->calcMethod[1] = 1;
 	/* Use default arguments if not manually overridden */
-	if(Vmax<0){structptr->Vmax = default_Vmax[structptr->lscape];}
+	if(structptr->Vmax<0){structptr->Vmax = default_Vmax[structptr->lscape];}
 
 	/* INITIALISE */
-	switch(args->lscape[0]) /* Calculation method for E(r) */
+	switch(structptr->calcMethod[0]) /* Calculation method for E(r) */
 	{
 		case 0:
 			break;
@@ -481,17 +489,17 @@ int initialise_metadynamics(int argc, char* argv[], argstruct* structptr)
 			structptr->eGrid = populate_landscape(structptr->bounds, structptr->n, structptr);
 			break;
 		default:
-			printf("No calculation method for E(r) with code %d\n", args->lscape[0]);
+			printf("No calculation method for E(r) with code %d\n", structptr->calcMethod[0]);
 			exit(EXIT_FAILURE);
 	}
-	switch(args->lscape[1]) /* Calculation method for grad E(r) */
+	switch(structptr->calcMethod[1]) /* Calculation method for grad E(r) */
 	{
 		case 0:
-			structptr->eGrid = populate_landscape(structptr->bounds, structptr->n, structptr);
+			break;
 		case 1:
 			break;
 		default:
-			printf("No calculation method for grad E(r) with code %d\n", args->lscape[1]);
+			printf("No calculation method for grad E(r) with code %d\n", structptr->calcMethod[1]);
 			exit(EXIT_FAILURE);
 	}
 
@@ -781,6 +789,9 @@ double* populate_landscape(double* bounds, int n, argstruct* args)
 	puts("Recursively calculating energy landscape");
 	recurse_landscape(indices, &indCount, indTemp, 0, nDim, n);
 
+	/* Temporarily change the calculation method from tabulated to on-the-fly so that the call to eval_potential doesn't try to interpolate it */
+
+
 	/* Populate grid at the points specified by 'ind' */
 	energies = (double*)malloc(nPoints*sizeof(double));
 	for(i=0; i<nPoints; i++)
@@ -799,4 +810,73 @@ double* populate_landscape(double* bounds, int n, argstruct* args)
 	free(indices);
 	free(r);
 	return energies;
+}
+
+int index2D(int indX, int indY, int nX)
+{
+    /* Converts 2D indices (indX, indY) into the equivalent index for the flattened array.
+    2D array must be of x-length nX */
+    return indX + nX*indY;
+}
+
+double interpolate(argstruct* args, double* r, int order)
+{
+    /* Interpolates the values at the point 'r'
+    order=0 - nearest-neighbour
+    order=1 - bilinear
+    order=2 - bicubic */
+
+    double energy=0;
+    double ind[2]; /* surface-style indices of point 'r' (not constrained to integer values) */
+
+	/* Check that the surface is 2D */
+	if(args->nDim != 2)
+	{
+		puts("Error: 'interpolate' called with non-2D surface. Exiting.");
+		exit(EXIT_FAILURE);
+	}
+
+    ind[0] = (r[0] - args->bounds[0])/args->deltas[0];
+    ind[1] = (r[1] - args->bounds[1])/args->deltas[1];
+    if(order==1)
+    {
+        double tl, tr, bl, br; /* Top-left, top-right, bottom-left, bottom-right.
+                                  Bottom and right are in the direction of increasing x and y */
+        double x1, x2, y1, y2;
+
+        /* Calculate (x, y) coordinates of grid nodes */
+        x1 = args->bounds[0] + (int)ind[0]*args->deltas[0];
+        x2 = args->bounds[0] + ((int)ind[0]+1)*args->deltas[0];
+        y1 = args->bounds[2] + (int)ind[0]*args->deltas[1];
+        y2 = args->bounds[2] + ((int)ind[0]+1)*args->deltas[1];
+
+        tl = args->eGrid[index2D((int)ind[0], (int)ind[1]+1, args->n)];
+        tr = args->eGrid[index2D((int)ind[0]+1, (int)ind[1]+1, args->n)];
+        bl = args->eGrid[index2D((int)ind[0], (int)ind[1], args->n)];
+        br = args->eGrid[index2D((int)ind[0]+1, (int)ind[1], args->n)];
+
+        energy=0;
+        energy += bl*(x2-r[0])*(y2-r[1]);
+        energy += br*(r[0]-x1)*(y2-r[1]);
+        energy += tl*(x2-r[0])*(r[1]-y1);
+        energy += tr*(r[0]-x1)*(r[1]-y1);
+        energy /= (x2-x1)*(y2-y1);
+        return energy;
+    }
+    else if(order==2)
+    {
+        puts("Bicubic interpolation not yet implemented.");
+        exit(EXIT_FAILURE);
+    }
+    else if(order==0)
+    {
+        puts("Nearest-neighbour interpolation not yet implemented");
+    }
+    else
+    {
+        puts("Order most be 0, 1 or 2");
+    }
+
+    /* Get neighbours */
+
 }
